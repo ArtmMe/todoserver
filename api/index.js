@@ -1,14 +1,23 @@
+require('dotenv').config();
 const express = require('express');
+const userRoutes = require('../routes/userRoutes');
+const todoRoutes = require('../routes/todoRoutes')
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
+
 app.use(express.json());
 app.use(express.urlencoded({extended: true}));
 
-app.get('/', (req, res) => {
-  res.send('Hello World')
-})
+app.use('/user', userRoutes)
 
-app.listen(port || 3000, () => {
+const checkLogin = (req, res, next) => {
+  if (!req.body || !req.body.login) {
+    return res.status(401).json({message: 'Сначала нужно авторизоваться'});
+  }
+  next();
+}
+app.use('/todo', checkLogin, todoRoutes)
+app.listen(port, () => {
   console.log('✅ server is running on ' + port)
 })
 
