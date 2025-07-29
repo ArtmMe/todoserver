@@ -1,4 +1,5 @@
 const supabase = require('../db/db');
+const pendingDeletions = new Map();
 const formatTodo = (todo) => ({
   id: todo.id,
   title: todo.title,
@@ -9,11 +10,12 @@ const formatTodo = (todo) => ({
   priority: todo.Priority.name
 })
 const getAll = async (req, res) => {
-  const { login } = req.body;
+  const userID = req.cookies.id;
   const { data, error } = await supabase
     .from('Todo')
-    .select(`*, User!inner(*), Status!inner(*), Category!inner(*), Priority!inner(*)`)
-    .eq('User.login', login);
+    .select(`*, Status!inner(*), Category!inner(*), Priority!inner(*)`)
+    .eq('user_id', userID)
+    .order('id', { ascending: true });
   if (error) {
     return res.status(500).json({message: error});
   }
@@ -26,12 +28,12 @@ const getAll = async (req, res) => {
 
 const getTodo = async (req, res) => {
   const {id} = req.params;
-  const {login} = req.body;
+  const userID = req.cookies.id;
   const {data} = await supabase
     .from('Todo')
-    .select(`*, User!inner(*), Status!inner(*), Category!inner(*), Priority!inner(*)`)
+    .select(`*,  Status!inner(*), Category!inner(*), Priority!inner(*)`)
     .eq('id', id)
-    .eq('User.login', login)
+    .eq('user_id', userID)
     .single();
   if (!data) {
     return res.status(200).json(null);
@@ -41,130 +43,158 @@ const getTodo = async (req, res) => {
 
 
 const createTask = async (req, res) => {
-  const {login, title, description, status, priority, category} = req.body;
+  const userID = req.cookies.id;
+  const {title, description, status, priority, category} = req.body;
   if (!title) {
     return res.status(404).json({message: 'Заголовок не найден'});
   }
-  const [userResult, categoryResult, statusResult, priorityResult] = await Promise.all([
-  supabase.from('User').select('id').eq('login', login).single(),
-  supabase.from('Category').select('id').eq('name', category).single(),
-  supabase.from('Status').select('id').eq('name', status).single(),
-  supabase.from('Priority').select('id').eq('name', priority).single()
-  ]);
+  const { data: IDData, error: IDError } = await supabase
+  .rpc('get_ids', {
+    p_user_id: userID,
+    p_category_name: category,
+    p_status_name: status,
+    p_priority_name: priority
+  }).single();
+
+  if (IDError) {
+    return res.status(500).json({messaage: 'Что-то пошло не так'})
+  }
     
-  const errors = {
-    user: userResult.error || !userResult.data ? 'Пользователь не найден' : null,
-    category: categoryResult.error || !categoryResult.data ? 'Категория не найдена' : null,
-    status: statusResult.error || !statusResult.data ? 'Статус не найден' : null,
-    priority: priorityResult.error || !priorityResult.data ? 'Приоритет не найден' : null
-  };
-    
-  const firstError = Object.values(errors).find(error => error !== null);
-  if (firstError) return res.status(404).json({message: firstError});
-    
-  const {error} = await supabase.from('Todo').insert({
+  const {data: newTodo, error} = await supabase.from('Todo').insert({
     title, 
     description, 
-    user_id: userResult.data.id, 
-    category_id: categoryResult.data.id, 
-    status_id: statusResult.data.id, 
-    priority_id: priorityResult.data.id
-  });
+    user_id: IDData.user_id, 
+    category_id: IDData.category_id, 
+    status_id: IDData.status_id, 
+    priority_id: IDData.priority_id
+  }).select(`
+    id, 
+    title, 
+    description, 
+    created_at,
+    Status:status_id(name), 
+    Category:category_id(name), 
+    Priority:priority_id(name)
+  `).single();
   if (error) {
     return res.status(500).json({message: error});
   }
-  res.status(201).json({message: 'Задача создана'});
+  res.status(201).json(formatTodo(newTodo));
 }
 
 const deleteTodo = async (req, res) => {
   const {id} = req.params;
-  const {login} = req.body;
+  const userID = req.cookies.id;
 
   const {data: todoCheck} = await supabase
     .from('Todo')
-    .select(`id, User!inner(*)`)
+    .select(`id`)
     .eq('id', id)
-    .eq('User.login', login)
+    .eq('user_id', userID)
     .single();
   if (!todoCheck) {
     return res.status(403).json({message: 'Задача не найдена'});
   }
-  const {error} = await supabase
-    .from('Todo')
-    .delete()
-    .eq('id', id);
-  if (error) {
-    return res.status(500).json({message: 'Что-то пошло не так'});
+
+  if (pendingDeletions.has(id)) {
+    clearTimeout(pendingDeletions.get(id));
   }
-  return res.status(200).json({message: 'Задача удалена'});
+
+  const timeoutId = setTimeout(async () => {
+    const {error} = await supabase
+      .from('Todo')
+      .delete()
+      .eq('id', id);
+      
+    pendingDeletions.delete(id);
+    
+  }, 5000);
+
+  pendingDeletions.set(id, timeoutId);
+  
+  return res.status(200).json({message: 'Задача будет удалена через 5 секунд'});
 }
+
+const cancelDeletion = async (req, res) => {
+  const {id} = req.params;
+  const userID = req.cookies.id;
+  
+  if (!pendingDeletions.has(id)) {
+    return res.status(404).json({message: 'Отложенное удаление не найдено'});
+  }
+  
+  const {data: todoCheck} = await supabase
+    .from('Todo')
+    .select(`id`)
+    .eq('id', id)
+    .eq('user_id', userID)
+    .single();
+  
+  if (!todoCheck) {
+    return res.status(403).json({message: 'Задача не найдена'});
+  }
+  
+  clearTimeout(pendingDeletions.get(id));
+  pendingDeletions.delete(id);
+  
+  return res.status(200).json({message: 'Удаление отменено'});
+};
 const updateTodo = async (req, res) => {
   const { id } = req.params;
-  const { login, updateFields } = req.body;
+  const { title, description, category, status, priority } = req.body;
+  const userID = req.cookies.id;
   
-  if (!updateFields) {
-    return res.status(200).json({ message: 'Данные успешно обновлены' });
-  }
   
   const { data: todoCheck } = await supabase
     .from('Todo')
-    .select(`id, User!inner(*)`)
+    .select(`id`)
     .eq('id', id)
-    .eq('User.login', login)
+    .eq('user_id', userID)
     .single();
     
   if (!todoCheck) {
     return res.status(403).json({ message: 'Задача не найдена' });
   }
 
-  const filteredUpdate = {};
-  
-  const promises = [];
-  
-  if ('title' in updateFields) filteredUpdate.title = updateFields.title;
-  if ('description' in updateFields) filteredUpdate.description = updateFields.description;
-  
-  const foreignKeyFields = [
-    { key: 'category', table: 'Category', idField: 'category_id', errorMessage: 'Категория не найдена' },
-    { key: 'status', table: 'Status', idField: 'status_id', errorMessage: 'Статус не найден' },
-    { key: 'priority', table: 'Priority', idField: 'priority_id', errorMessage: 'Приоритет не найден' }
-  ];
-    
-  for (const field of foreignKeyFields) {
-    if (field.key in updateFields) {
-      promises.push(
-        (async () => {
-          const { data, error } = await supabase
-            .from(field.table)
-            .select('id')
-            .eq('name', updateFields[field.key])
-            .single();
-            
-          if (error || !data) {
-            throw { status: 404, message: field.errorMessage };
-          }
-          
-          filteredUpdate[field.idField] = data.id;
-        })()
-      );
-    }
+  const { data: IDData, error: IDError } = await supabase
+  .rpc('get_ids', {
+    p_user_id: userID,
+    p_category_name: category,
+    p_status_name: status,
+    p_priority_name: priority
+  }).single();
+
+  if (IDError) {
+    return res.status(500).json({messaage: 'Что-то пошло не так'})
   }
-  await Promise.all(promises); 
+
   
-  if (Object.keys(filteredUpdate).length <= 0) {
-    return res.status(200).json({ message: 'Данные успешно обновлены' });
-  }
-  
-  const { error } = await supabase
+  const { data: updatedTodo, error: updateError } = await supabase
     .from('Todo')
-    .update(filteredUpdate)
-    .eq('id', id);
+    .update({
+      title,
+      description,
+      category_id: IDData.category_id,
+      status_id: IDData.status_id,
+      priority_id: IDData.priority_id
+    })
+    .eq('id', id)
+    .select(`
+      id, 
+      title, 
+      description, 
+      created_at,
+      Status:status_id(name), 
+      Category:category_id(name), 
+      Priority:priority_id(name)
+    `)
+    .single();;
     
-  if (error) {
+  if (updateError) {
     return res.status(500).json({ message: 'Что-то пошло не так' });
   }
   
-  return res.status(200).json({ message: 'Данные успешно обновлены' });
+  return res.status(200).json(formatTodo(updatedTodo));
 };
 
-module.exports = { getAll, createTask, getTodo, deleteTodo, updateTodo };
+module.exports = { getAll, createTask, getTodo, deleteTodo, updateTodo, cancelDeletion };
